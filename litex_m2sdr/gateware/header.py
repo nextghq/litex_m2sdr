@@ -34,6 +34,13 @@ class HeaderInserterExtractor(LiteXModule):
         self.update        = Signal()   # o
         self.header        = Signal(64) # i (Inserter) / o (Extractor)
         self.timestamp     = Signal(64) # i (Inserter) / o (Extractor)
+        # i (Inserter): the timestamp is a value that travels WITH the first payload word (its
+        # sample index) rather than a free-running clock. Then the timestamp word must not be
+        # emitted until that word is waiting at the sink, the value must be taken unregistered
+        # (a registered copy could be a cycle stale, which for an index means the wrong word), and
+        # rx_offset must not be applied -- it is a nanosecond plane correction, meaningless on an
+        # index. Driven by the SoC from the sample-time-base mode bit.
+        self.stamp_on_payload = Signal()
 
         self.enable        = Signal()   # i (CSR).
         self.header_enable = Signal()   # i (CSR).
@@ -90,6 +97,11 @@ class HeaderInserterExtractor(LiteXModule):
             Mux(self.timestamp >= self.rx_offset, self.timestamp - self.rx_offset, 0))
         self.stamp_time = stamp_time
 
+        # Value actually emitted: the rx_offset-corrected registered copy in nanosecond mode, the
+        # live index when stamping on the payload word (see stamp_on_payload above).
+        stamp_value = Signal(64)
+        self.comb += stamp_value.eq(Mux(self.stamp_on_payload, self.timestamp, stamp_time))
+
         # FSM.
         # ----
         self.fsm = fsm = ResetInserter()(FSM(reset_state="RESET"))
@@ -124,10 +136,10 @@ class HeaderInserterExtractor(LiteXModule):
                 # 128-bit: sync + timestamp (antenna-plane corrected, see stamp_time above) in
                 # one word -> straight to FRAME.
                 fsm.act("HEADER",
-                    source.valid.eq(1),
+                    source.valid.eq(~self.stamp_on_payload | sink.valid),
                     source.first.eq(1),
                     source.data[0:64].eq(self.header),
-                    source.data[64:128].eq(stamp_time),
+                    source.data[64:128].eq(stamp_value),
                     If(source.valid & source.ready,
                         NextValue(self.update, 1),
                         NextState("FRAME"),
@@ -145,8 +157,8 @@ class HeaderInserterExtractor(LiteXModule):
                 )
                 # Timestamp (antenna-plane corrected, see stamp_time above).
                 fsm.act("TIMESTAMP",
-                    source.valid.eq(1),
-                    source.data[0:64].eq(stamp_time),
+                    source.valid.eq(~self.stamp_on_payload | sink.valid),
+                    source.data[0:64].eq(stamp_value),
                     If(source.valid & source.ready,
                         NextValue(self.update, 1),
                         NextState("FRAME"),

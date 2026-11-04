@@ -878,7 +878,12 @@ class BaseSoC(SoCMini):
         self.comb += self.header.tx.time.eq(self.time_gen.time)
         self.comb += [
             self.header.rx.header.eq(0x5aa5_5aa5_5aa5_5aa5), # Unused for now, arbitrary.
-            self.header.rx.timestamp.eq(self.time_gen.time),
+            # Sample-count time base: stamp RX frames with the index of their first sample
+            # instead of the nanosecond clock (see gateware/sample_time.py).
+            self.header.rx.timestamp.eq(Mux(self.ad9361.tick_mode,
+                                            self.ad9361.rx_tick,
+                                            self.time_gen.time)),
+            self.header.rx.stamp_on_payload.eq(self.ad9361.tick_mode),
         ]
 
         # TX/RX Datapath ---------------------------------------------------------------------------
