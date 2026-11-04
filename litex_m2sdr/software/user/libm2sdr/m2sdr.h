@@ -944,6 +944,22 @@ int m2sdr_set_tx_offset(struct m2sdr_dev *dev, uint64_t offset_ns);
  * fields count the separate DMA-ring underflow (reader starved of any buffer). LitePCIe. */
 int m2sdr_get_tx_underflow(struct m2sdr_dev *dev, uint32_t *underflow);
 
+/* Sample-count time base (gateware sample_time): the AD9361 core counts samples in the RFIC clock
+ * domain -- the only clock the ADC and the DAC really share. With the time base set to ticks, RX
+ * frame headers carry the index of the frame's first sample instead of a nanosecond stamp, so a
+ * consumer that counts samples (a 5G lower PHY, anything USRP-shaped) needs no ns<->sample
+ * conversion. At 23.04 MSps a sample is 43.4 ns, so a nanosecond stamp cannot name a sample index
+ * exactly and every conversion costs +-1 sample. LitePCIe only. */
+struct m2sdr_sample_time_status {
+    bool ticks;       /* time base = sample counter */
+    bool rx_overflow; /* RX tick queue overflowed (sample format not 1:1) */
+};
+bool m2sdr_has_sample_timebase(struct m2sdr_dev *dev);
+int  m2sdr_set_sample_timebase(struct m2sdr_dev *dev, bool ticks);
+int  m2sdr_get_sample_time(struct m2sdr_dev *dev, uint64_t *tick);
+int  m2sdr_set_sample_time(struct m2sdr_dev *dev, uint64_t tick);
+int  m2sdr_get_sample_time_status(struct m2sdr_dev *dev, struct m2sdr_sample_time_status *status);
+
 /* Set the RX timestamp offset (ns): the mirror of tx_offset. The RX header inserter stamps
  * each buffer when it starts forming (DMA plane); rx_offset is subtracted so the stamp
  * refers to when the first sample was at the ANTENNA. With both offsets calibrated, TX and
