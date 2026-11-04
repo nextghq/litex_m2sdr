@@ -60,6 +60,10 @@
 /*                                       Defines                                                   */
 /* ----------------------------------------------------------------------------------------------- */
 
+/* Post-reset settle budget for the first BAR0 read (see litepcie_pci_probe). */
+#define IDENTIFIER_SETTLE_TRIES   50
+#define IDENTIFIER_SETTLE_STEP_MS 10
+
 #define LITEPCIE_NAME "m2sdr"
 #define LITEPCIE_MINOR_COUNT 32
 
@@ -2290,6 +2294,7 @@ static int litepcie_pci_probe(struct pci_dev *dev, const struct pci_device_id *i
 #ifdef CSR_PTM_REQUESTER_BASE
 	int count = 100;
 #endif
+	unsigned settle;
 
 	dev_info(&dev->dev, "\e[1m[Probing device]\e[0m\n");
 
@@ -2357,14 +2362,44 @@ static int litepcie_pci_probe(struct pci_dev *dev, const struct pci_device_id *i
 	msleep(10);
 #endif
 
-	/* Read and display the FPGA identifier.
+	/* Wait for the core to answer before reading the identifier.
 	 *
-	 * Bail out on the first all-ones word: an unreachable core reads back
+	 * The reset above is not instantaneous. On a re-probe -- modprobe after a
+	 * previous rmmod, which is the normal way to recover a wedged DMA -- the
+	 * core has been observed still reading back all-ones well after the 10 ms
+	 * above, while being perfectly alive: reading BAR0 from user space through
+	 * sysfs resource0 at that moment returns the identifier string, and the
+	 * link is up (D0, full width and speed). A fresh boot-time probe does not
+	 * show it. Treating that transient as a dead core turns a reload into
+	 * "probe failed with error -5" and no device node.
+	 *
+	 * So poll the first word instead of giving up on it, with a bounded budget.
+	 * This keeps the reason the check exists: an unreachable core reads back
 	 * 0xffffffff on every access and each of those reads costs a full PCIe
-	 * completion timeout (up to 50 ms). Blindly reading the whole 256-word
-	 * region then stalls the machine for the best part of a minute before
-	 * logging a "Version \xff\xff..." string and continuing into a probe that
-	 * cannot work anyway. */
+	 * completion timeout (up to 50 ms), so blindly reading the whole 256-word
+	 * region stalls the machine for the best part of a minute before logging a
+	 * "Version \xff\xff..." string and continuing into a probe that cannot
+	 * work anyway. Here a genuinely dead core costs at most
+	 * IDENTIFIER_SETTLE_TRIES * (50 ms completion timeout + 10 ms sleep) ~= 3 s
+	 * before the same -EIO, while a slow one is simply waited for. */
+	for (settle = 0; settle < IDENTIFIER_SETTLE_TRIES; settle++) {
+		if (litepcie_readl(litepcie_dev, CSR_IDENTIFIER_MEM_BASE) != 0xffffffff)
+			break;
+		msleep(IDENTIFIER_SETTLE_STEP_MS);
+	}
+	if (settle == IDENTIFIER_SETTLE_TRIES) {
+		dev_err(&dev->dev,
+			"BAR0 still reads all-ones %u ms after the core reset: link down or core unresponsive\n",
+			IDENTIFIER_SETTLE_TRIES * IDENTIFIER_SETTLE_STEP_MS);
+		ret = -EIO;
+		goto fail1;
+	}
+	if (settle)
+		dev_info(&dev->dev, "Core answered %u ms after reset.\n",
+			 settle * IDENTIFIER_SETTLE_STEP_MS);
+
+	/* Read and display the FPGA identifier. The per-word guard stays as a net in
+	 * case the core stops answering midway through the region. */
 	for (i = 0; i < (int)sizeof(fpga_identifier) - 1; i++) {
 		uint32_t word = litepcie_readl(litepcie_dev, CSR_IDENTIFIER_MEM_BASE + i * 4);
 
