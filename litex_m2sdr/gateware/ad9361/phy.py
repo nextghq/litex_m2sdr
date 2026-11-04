@@ -177,6 +177,13 @@ class AD9361PHY(LiteXModule):
         rx_data_ib  = Signal(12)
         rx_data_qb  = Signal(12)
         rx_valid    = Signal()
+
+        # Sample-time hooks (see gateware/sample_time.py): the sample counter lives in the rfic
+        # domain and must advance on every received PHY word, consumed or not, by the number of
+        # sample periods that word carries (2 in 1R1T, 1 in 2R2T).
+        self.mode_rfic = mode      # o (rfic): 1 = 1R1T (a word is two consecutive samples).
+        self.rx_strobe = Signal()  # o (rfic): one pulse per received PHY word, consumed or not.
+        self.comb += self.rx_strobe.eq(rx_valid)  # Unconditional: loopback must not stall time.
         rx_source_ia = Signal(12)
         rx_source_qa = Signal(12)
         rx_source_ib = Signal(12)

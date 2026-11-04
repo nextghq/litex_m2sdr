@@ -17,6 +17,7 @@ from litepcie.common import *
 from litex_m2sdr.gateware.gpio import GPIORXPacker, GPIOTXUnpacker
 
 from litex_m2sdr.gateware.cdc import ClockDomainCrossingRegistered
+from litex_m2sdr.gateware.sample_time import RXTickAttach, RXTickTracker, rx_tick_layout
 
 from litex_m2sdr.gateware.ad9361.phy              import AD9361PHY
 from litex_m2sdr.gateware.ad9361.phy_oversampling import AD9361OversamplingPHY
@@ -90,9 +91,10 @@ from litex_m2sdr.gateware.ad9361.agc     import (
 # AD9361 RFIC --------------------------------------------------------------------------------------
 
 class AD9361RFICStreamBypass(LiteXModule):
-    def __init__(self, data_width=64):
-        self.sink   = stream.Endpoint(dma_layout(data_width))
-        self.source = stream.Endpoint(dma_layout(data_width))
+    def __init__(self, data_width=64, layout=None):
+        layout = dma_layout(data_width) if layout is None else layout
+        self.sink   = stream.Endpoint(layout)
+        self.source = stream.Endpoint(layout)
 
         # # #
 
@@ -203,6 +205,45 @@ class AD9361RFIC(LiteXModule):
         self.gpio_tx_unpacker = gpio_tx_unpacker = GPIOTXUnpacker()
         self.gpio_rx_packer   = gpio_rx_packer   = GPIORXPacker()
 
+        # Sample Counter (time base) ---------------------------------------------------------------
+        # See gateware/sample_time.py. ``tick`` is the index of the first sample of the PHY word
+        # being received, counted in the rfic domain: it advances on every RX word strobe (consumed
+        # or not) by the sample periods that word carries -- 2 in 1R1T, 1 in 2R2T. The rfic clock is
+        # the only one the ADC and the DAC share, so a stamp taken against it is exact by
+        # construction, with no nanosecond conversion and no second oscillator involved.
+        self._tick_control = CSRStorage(fields=[
+            CSRField("timebase", size=1, offset=0, values=[
+                ("``0b0``", "Frame timestamps use time_gen (nanoseconds)."),
+                ("``0b1``", "Frame timestamps use the sample counter (ticks)."),
+            ]),
+            CSRField("load", size=1, offset=1, pulse=True, description="Load tick_write into the counter."),
+            CSRField("read", size=1, offset=2, pulse=True, description="Latch the counter into tick_read."),
+        ])
+        self._tick_write  = CSRStorage(64, description="Value loaded into the sample counter.")
+        self._tick_read   = CSRStatus(64,  description="Sample counter (sys view), latched by control.read.")
+        self._tick_status = CSRStatus(fields=[
+            CSRField("rx_overflow", size=1, offset=0, description="RX tick queue overflowed (non 1:1 sample format)."),
+        ])
+
+        self.tick      = tick    = Signal(64)  # rfic.
+        self.tick_inc  = Signal(2)             # sys:  sample periods per PHY word.
+        tick_inc_rfic  = Signal(2)             # rfic.
+        self.tick_mode = Signal()              # sys:  1 = the time base is the sample counter.
+        self.comb += [
+            self.tick_inc.eq(Mux(self.phy.control.fields.mode, 2, 1)),
+            tick_inc_rfic.eq(Mux(self.phy.mode_rfic, 2, 1)),
+            self.tick_mode.eq(self._tick_control.fields.timebase),
+        ]
+        self.tick_load_ps = tick_load_ps = PulseSynchronizer("sys", "rfic")
+        self.comb += tick_load_ps.i.eq(self._tick_control.fields.load)
+        self.sync.rfic += [
+            If(tick_load_ps.o,
+                tick.eq(self._tick_write.storage),  # Static by the time the pulse has crossed.
+            ).Elif(self.phy.rx_strobe,
+                tick.eq(tick + tick_inc_rfic),
+            )
+        ]
+
         # Cross domain crossing --------------------------------------------------------------------
         if oversampling:
             # Registered-flags CDC FIFOs: keep the pointer synchronizers out of the memory port
@@ -220,7 +261,7 @@ class AD9361RFIC(LiteXModule):
                 registered_read  = True,
             )
             self.rx_cdc = rx_cdc = ClockDomainCrossingRegistered(
-                layout  = dma_layout(dw),
+                layout  = rx_tick_layout(dw), # Each word crosses with its own sample index.
                 cd_from = "rfic",
                 cd_to   = "sys",
                 # rfic_clk-clocked LUTRAM writes violate the RAMD32 min low-pulse-width at 491.52MHz.
@@ -234,7 +275,7 @@ class AD9361RFIC(LiteXModule):
                 with_common_rst = True
             )
             self.rx_cdc = rx_cdc = stream.ClockDomainCrossing(
-                layout  = dma_layout(dw),
+                layout  = rx_tick_layout(dw), # Each word crosses with its own sample index.
                 cd_from = "rfic",
                 cd_to   = "sys",
                 with_common_rst = True
@@ -264,10 +305,10 @@ class AD9361RFIC(LiteXModule):
 
         if with_rx_fifo:
             self.rx_rfic_fifo = rx_rfic_fifo = ClockDomainsRenamer("rfic")(
-                stream.SyncFIFO(dma_layout(dw), depth=rx_fifo_depth, buffered=True)
+                stream.SyncFIFO(rx_tick_layout(dw), depth=rx_fifo_depth, buffered=True)
             )
         else:
-            self.rx_rfic_fifo = rx_rfic_fifo = AD9361RFICStreamBypass(dw)
+            self.rx_rfic_fifo = rx_rfic_fifo = AD9361RFICStreamBypass(layout=rx_tick_layout(dw))
 
         # BitMode ----------------------------------------------------------------------------------
         self.tx_bitmode = tx_bitmode = AD9361TXBitMode(data_width=dw)
@@ -322,7 +363,20 @@ class AD9361RFIC(LiteXModule):
             rx_stages.append(rx_gather_ibuf)
             self.rx_gather = rx_gather = ClockDomainsRenamer("rfic")(stream.Converter(64, 128))
             rx_stages.append(rx_gather)
-        rx_stages += [rx_rfic_fifo, rx_cdc, rx_bitmode, rx_buffer, self.source]
+        # Attach the tick in the rfic domain after any repacking, strip it in sys before bit-mode:
+        # the bit-mode/buffer/source stages downstream stay on dma_layout and are untouched.
+        self.rx_tick_attach = rx_tick_attach = ClockDomainsRenamer("rfic")(RXTickAttach(dw))
+        self.comb += rx_tick_attach.tick.eq(tick)
+        self.rx_tick_tracker = rx_tick_tracker = RXTickTracker()
+        self.rx_tick     = rx_tick_tracker.tick  # sys: tick of the word offered to the consumer.
+        self.rx_tick_now = rx_tick_tracker.now   # sys: tick following the newest word taken.
+        self.comb += [
+            rx_tick_tracker.inc.eq(self.tick_inc),
+            rx_tick_tracker.exact.eq(self._bitmode.fields.mode == 0b00),
+            self._tick_status.fields.rx_overflow.eq(0),  # No queue: the tick rides with its word.
+        ]
+        self.sync += If(self._tick_control.fields.read, self._tick_read.status.eq(rx_tick_tracker.now))
+        rx_stages += [rx_tick_attach, rx_rfic_fifo, rx_cdc, rx_tick_tracker, rx_bitmode, rx_buffer, self.source]
         self.rx_pipeline = stream.Pipeline(*rx_stages)
 
     def add_timing_constraints(self, platform):

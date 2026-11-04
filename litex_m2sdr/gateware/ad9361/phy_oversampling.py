@@ -273,6 +273,12 @@ class AD9361OversamplingPHY(LiteXModule):
         rx_data_ib   = Signal(12)
         rx_data_qb   = Signal(12)
         rx_valid     = Signal()
+
+        # Sample-time hooks, as in phy.py: the rfic-domain sample counter advances on every
+        # received PHY word, consumed or not. Unconditional so loopback cannot stall time.
+        self.mode_rfic = mode      # o (rfic): 1 = 1R1T (a word is two consecutive samples).
+        self.rx_strobe = Signal()  # o (rfic): one pulse per received PHY word.
+        self.comb += self.rx_strobe.eq(rx_valid)
         rx_source_ia = Signal(12)
         rx_source_qa = Signal(12)
         rx_source_ib = Signal(12)
